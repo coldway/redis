@@ -79,7 +79,7 @@ struct RedisModuleSharedAPI {
 };
 typedef struct RedisModuleSharedAPI RedisModuleSharedAPI;
 
-static dict *modules; /* Hash table of modules. SDS -> RedisModule ptr.*/
+static dict *modules; /* Hash table of modules. SDS -> odulRedisMe ptr.*/
 
 /* Entries in the context->amqueue array, representing objects to free
  * when the callback returns. */

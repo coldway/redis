@@ -3731,6 +3731,14 @@ static int clusterManagerMoveSlot(clusterManagerNode *source,
 
 /* Flush the dirty node configuration by calling replicate for slaves or
  * adding the slots defined in the masters. */
+/*
+ * 如果是主节点，则执行数据分片配置。redis-cli使用CLUSTER ADDSLOTS命令设置节点负责的哈希槽；
+ * 主节点接收后，会进行如下修改操作：
+ *      如果集群状态clusterState->importing_slots不为空，则设置为NULL；
+ *      修改myself的slots字段，以bitmap方式设置当前节点负责的哈希槽范围；
+ * 如果是从节点，则为其设置主节点。redis-cli向从节点发送CLUSTER REPLICATE命令；
+ * 从节点接收后，执行主从复制，不再赘述。
+ */
 static int clusterManagerFlushNodeConfig(clusterManagerNode *node, char **err) {
     if (!node->dirty) return 0;
     redisReply *reply = NULL;
@@ -5357,6 +5365,18 @@ cluster_manager_err:
 }
 
 /* Cluster Manager Commands */
+/*
+ * 根据输入参数，redis-ci依次创建集群管理节点，并与每个节点建立网络链接，获取节点及已有集群信息；
+ * 依次检查输入的节点，如是否为集群已有节点、节点是否为空；
+ * 主从节点分配、哈希槽分配，判断节点是否满足集群创建的条件：至少三个主节点；
+ * 输出哈希槽分片及主从节点分配，并在得到用户许可后执行节点配置：
+ *     针对主节点：  通过CLUSTER ADDSLOTS命令，添加主节点负责的哈希槽范围；
+ *     针对从节点：  通过CLUSTER REPLICATE命令，创建主从复制关系；
+ *     针对所有节点：通过cluster set-config-epoch命令，使其配置纪元（config epoch）加1；
+ * redis-cli通过cluster meet命令触发节点握手过程，节点之间通过集群总线（Cluster Bus）传递MEET、PING、PONG等信息，逐步建立起集群关系；
+ * 通过7000端口的节点检查集群节点及哈希槽分配情况。
+ * 还有非常重要的一点上图没有体现到：当集群建立以后，节点之间就会通过集群总线，使用二进制协议Gossip不断进行“闲聊”，以此完成节点发现、健康检查、故障检测、故障转移、配置更新、从节点迁移等工作。
+ */
 
 static int clusterManagerCommandCreate(int argc, char **argv) {
     int i, j, success = 1;
@@ -5373,12 +5393,15 @@ static int clusterManagerCommandCreate(int argc, char **argv) {
         *c = '\0';
         char *ip = addr;
         int port = atoi(++c);
+        //新建cluster node
         clusterManagerNode *node = clusterManagerNewNode(ip, port);
+        //根据node里的信息，建立连接
         if (!clusterManagerNodeConnect(node)) {
             freeClusterManagerNode(node);
             return 0;
         }
         char *err = NULL;
+        //是否开启redis cluster
         if (!clusterManagerNodeIsCluster(node, &err)) {
             clusterManagerPrintNotClusterNodeError(node, err);
             if (err) zfree(err);
@@ -5386,6 +5409,7 @@ static int clusterManagerCommandCreate(int argc, char **argv) {
             return 0;
         }
         err = NULL;
+        //获取node的opt
         if (!clusterManagerNodeLoadInfo(node, 0, &err)) {
             if (err) {
                 CLUSTER_MANAGER_PRINT_REPLY_ERROR(node, err);
@@ -5536,6 +5560,7 @@ assign_replicas:
         while ((ln = listNext(&li)) != NULL) {
             clusterManagerNode *node = ln->value;
             char *err = NULL;
+            //发送配置
             int flushed = clusterManagerFlushNodeConfig(node, &err);
             if (!flushed && node->dirty && !node->replicate) {
                 if (err != NULL) {
@@ -5551,6 +5576,7 @@ assign_replicas:
                               "each node\n");
         int config_epoch = 1;
         listRewind(cluster_manager.nodes, &li);
+        //针对所有节点：通过cluster set-config-epoch命令，使其配置纪元（config epoch）加1；
         while ((ln = listNext(&li)) != NULL) {
             clusterManagerNode *node = ln->value;
             redisReply *reply = NULL;
@@ -5563,6 +5589,7 @@ assign_replicas:
                               "the cluster\n");
         clusterManagerNode *first = NULL;
         listRewind(cluster_manager.nodes, &li);
+        //通过cluster meet命令触发节点握手过程，节点之间通过集群总线（Cluster Bus）传递MEET、PING、PONG等信息，逐步建立起集群关系
         while ((ln = listNext(&li)) != NULL) {
             clusterManagerNode *node = ln->value;
             if (first == NULL) {
@@ -5590,6 +5617,7 @@ assign_replicas:
          * waiting for cluster join will find all the nodes agree about
          * the config as they are still empty with unassigned slots. */
         sleep(1);
+        //check集群节点的情况
         clusterManagerWaitForClusterJoin();
         /* Useful for the replicas */
         listRewind(cluster_manager.nodes, &li);

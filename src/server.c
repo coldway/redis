@@ -1758,6 +1758,14 @@ void databasesCron(void) {
  * info or not using the 'update_daylight_info' argument. Normally we update
  * such info only when calling this function from serverCron() but not when
  * calling it from call(). */
+/*
+ * 每个对象，每次被访问的时候，有个access-time，这个时间，不需要那么精确，没必要每次去new date()，
+ * 用缓存的时间就行了，这样能比较快。全局时间，缓存在server.unixtime 和 server.mstime中。
+ *
+ * 更新server时间，redis server在很多时候，都需要获取当前时间，就像我们写业务代码差不多，
+ * 但是，redis比较扣，扣什么？扣性能。在不需要获取当前时间的时候，redis觉得，获取一个不那么准确的时间就行了。
+ * 所以，就缓存了一个全局时间，这个全局时间，什么时候刷新呢，就在这个周期任务中。
+ */
 void updateCachedTime(int update_daylight_info) {
     server.ustime = ustime();
     server.mstime = server.ustime / 1000;
@@ -1937,6 +1945,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
 
     /* We received a SIGTERM, shutting down here in a safe way, as it is
      * not ok doing so inside the signal handler. */
+    //收到 SIGTERM 则会调用 prepareForShutdown 后关闭服务器
     if (server.shutdown_asap) {
         if (prepareForShutdown(SHUTDOWN_NOFLAGS) == C_OK) exit(0);
         serverLog(LL_WARNING,"SIGTERM received but errors trying to shut down the server, check the logs for more information");
@@ -1970,13 +1979,18 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     }
 
     /* We need to do a few operations on clients asynchronously. */
+    // 检查客户端，关闭超时客户端，并释放客户端多余的缓冲区
     clientsCron();
 
     /* Handle background operations on Redis databases. */
+    // 对数据库执行各种操作
     databasesCron();
 
     /* Start a scheduled AOF rewrite if this was requested by the user while
      * a BGSAVE was in progress. */
+    // 如果 BGSAVE 和 BGREWRITEAOF 都没有在执行
+    // 并且有一个 BGREWRITEAOF 在等待，那么执行 BGREWRITEAOF
+    /* 检查是否手动执行了AOF写入命令*/
     if (!hasActiveChildProcess() &&
         server.aof_rewrite_scheduled)
     {
@@ -1984,12 +1998,14 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     }
 
     /* Check if a background saving or AOF rewrite in progress terminated. */
+    // 检查 BGSAVE 或者 BGREWRITEAOF 是否已经执行完毕
     if (hasActiveChildProcess() || ldbPendingChildren())
     {
         checkChildrenDone();
     } else {
         /* If there is not a background saving/rewrite in progress check if
          * we have to save/rewrite now. */
+        // 遍历每一个 rdb 保存条件
         for (j = 0; j < server.saveparamslen; j++) {
             struct saveparam *sp = server.saveparams+j;
 
@@ -1997,22 +2013,33 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
              * the given amount of seconds, and if the latest bgsave was
              * successful or if, in case of an error, at least
              * CONFIG_BGSAVE_RETRY_DELAY seconds already elapsed. */
+            // 如果 数据保存记录 大于规定的修改次数 且距离 上一次保存的时间大于规定时间或者上次BGSAVE命令执行成功，
+            // 才执行 BGSAVE 操作
             if (server.dirty >= sp->changes &&
                 server.unixtime-server.lastsave > sp->seconds &&
                 (server.unixtime-server.lastbgsave_try >
                  CONFIG_BGSAVE_RETRY_DELAY ||
                  server.lastbgsave_status == C_OK))
             {
+                // 记录日志
                 serverLog(LL_NOTICE,"%d changes in %d seconds. Saving...",
                     sp->changes, (int)sp->seconds);
                 rdbSaveInfo rsi, *rsiptr;
+                // 保存信息
                 rsiptr = rdbPopulateSaveInfo(&rsi);
+                // 异步保存操作
                 rdbSaveBackground(server.rdb_filename,rsiptr);
                 break;
             }
         }
 
         /* Trigger an AOF rewrite if needed. */
+        /*
+         * 定期检查 redis 使用内存大小，当超过配置的阈值，触发自动重写
+         * 需要开启aof且需要百分比配置和内存重现下限。
+         * 同时there are active children processes doing RDB saving,
+         * AOF rewriting, or some side process spawned by a loaded module.
+         */
         if (server.aof_state == AOF_ON &&
             !hasActiveChildProcess() &&
             server.aof_rewrite_perc &&
@@ -2031,6 +2058,8 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
 
     /* AOF postponed flush: Try at every cron cycle if the slow fsync
      * completed. */
+    // 根据 AOF 政策，
+    // AOF缓存定时写入磁盘
     if (server.aof_flush_postponed_start) flushAppendOnlyFile(0);
 
     /* AOF write errors: in this case we have a buffer to flush as well and
@@ -2043,18 +2072,22 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     }
 
     /* Clear the paused clients flag if needed. */
+    /* 清理无用的客户端连接 */
     clientsArePaused(); /* Don't check return value, just use the side effect.*/
 
     /* Replication cron function -- used to reconnect to master,
      * detect transfer failures, start background RDB transfers and so forth. */
+    //执行主从同步相关定期任务
     run_with_period(1000) replicationCron();
 
     /* Run the Redis Cluster cron. */
+    /* 运行cluster定时任务 */
     run_with_period(100) {
         if (server.cluster_enabled) clusterCron();
     }
 
     /* Run the Sentinel timer if we are in sentinel mode. */
+    /* 哨兵模式定时任务执行 */
     if (server.sentinel_mode) sentinelTimer();
 
     /* Cleanup expired MIGRATE cached sockets. */
@@ -2069,6 +2102,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
      * command execution, but we want to be sure that if the last command
      * executed changes the value via CONFIG SET, the server will perform
      * the operation even if completely idle. */
+    /* 定时检查slot信息 */
     if (server.tracking_clients) trackingLimitUsedSlots();
 
     /* Start a scheduled BGSAVE if the corresponding flag is set. This is
@@ -2090,6 +2124,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     }
 
     /* Fire the cron loop modules event. */
+    /*定时模块定时任务执行 */
     RedisModuleCronLoopV1 ei = {REDISMODULE_CRON_LOOP_VERSION,server.hz};
     moduleFireServerEvent(REDISMODULE_EVENT_CRON_LOOP,
                           0,
@@ -2137,6 +2172,9 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     handleBlockedClientsTimeout();
 
     /* We should handle pending reads clients ASAP after event loop. */
+    /*
+     * 处理需要read的client
+     */
     handleClientsWithPendingReadsUsingThreads();
 
     /* Handle TLS pending data. (must be done before flushAppendOnlyFile) */
@@ -2153,6 +2191,9 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 
     /* Run a fast expire cycle (the called function will return
      * ASAP if a fast cycle is not needed). */
+    /*
+     * 执行一次快速的主动过期检查
+     */
     if (server.active_expire_enabled && server.masterhost == NULL)
         activeExpireCycle(ACTIVE_EXPIRE_CYCLE_FAST);
 
@@ -2192,9 +2233,15 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
     trackingBroadcastInvalidationMessages();
 
     /* Write the AOF buffer on disk */
+    /*
+     * 刷新aof缓存到磁盘
+     */
     flushAppendOnlyFile(0);
 
     /* Handle writes with pending output buffers. */
+    /*
+     * 需要处理write的client
+     */
     handleClientsWithPendingWritesUsingThreads();
 
     /* Close clients that need to be closed asynchronous */
@@ -2429,7 +2476,7 @@ void initServerConfig(void) {
      * redis.conf using the rename-command directive. */
     server.commands = dictCreate(&commandTableDictType,NULL);
     server.orig_commands = dictCreate(&commandTableDictType,NULL);
-    populateCommandTable();
+    populateCommandTable(); //这里才真实将命令对照表赋值到server.commands和server.orig_commands
     server.delCommand = lookupCommandByCString("del");
     server.multiCommand = lookupCommandByCString("multi");
     server.lpushCommand = lookupCommandByCString("lpush");
@@ -3231,7 +3278,7 @@ void preventCommandReplication(client *c) {
  * Specifically:
  *
  * 1. If the client flags CLIENT_FORCE_AOF or CLIENT_FORCE_REPL are set
- *    and assuming the corresponding CMD_CALL_PROPAGATE_AOF/REPL is set
+ *    and assuming the co rresponding CMD_CALL_PROPAGATE_AOF/REPL is set
  *    in the call flags, then the command is propagated even if the
  *    dataset was not affected by the command.
  * 2. If the client flags CLIENT_PREVENT_REPL_PROP or CLIENT_PREVENT_AOF_PROP
@@ -3261,6 +3308,10 @@ void call(client *c, int flags) {
 
     /* Send the command to clients in MONITOR mode if applicable.
      * Administrative commands are considered too dangerous to be shown. */
+    /*
+     * 如果适用，将命令发送到处于 MONITOR 模式的客户端。
+     * 管理命令被认为太危险而不能显示。
+     */
     if (listLength(server.monitors) &&
         !server.loading &&
         !(c->cmd->flags & (CMD_SKIP_MONITOR|CMD_ADMIN)))
@@ -3270,6 +3321,7 @@ void call(client *c, int flags) {
 
     /* Initialization: clear the flags that must be set by the command on
      * demand, and initialize the array for additional commands propagation. */
+    //初始化
     c->flags &= ~(CLIENT_FORCE_AOF|CLIENT_FORCE_REPL|CLIENT_PREVENT_PROP);
     redisOpArray prev_also_propagate = server.also_propagate;
     redisOpArrayInit(&server.also_propagate);
@@ -3278,6 +3330,7 @@ void call(client *c, int flags) {
     dirty = server.dirty;
     updateCachedTime(0);
     start = server.ustime;
+    //正式执行指令
     c->cmd->proc(c);
     duration = ustime()-start;
     dirty = server.dirty-dirty;
@@ -3291,6 +3344,8 @@ void call(client *c, int flags) {
     /* If the caller is Lua, we want to force the EVAL caller to propagate
      * the script if the command flag or client flag are forcing the
      * propagation. */
+    // 当执行命令的是lua脚本的时候，如果命令的flags或者客户端的flags是强制传播行为，
+    // 那么我们将强制命令调用者去传播lua脚本
     if (c->flags & CLIENT_LUA && server.lua_caller) {
         if (c->flags & CLIENT_FORCE_REPL)
             server.lua_caller->flags |= CLIENT_FORCE_REPL;
@@ -3300,6 +3355,7 @@ void call(client *c, int flags) {
 
     /* Log the command into the Slow log if needed, and populate the
      * per-command statistics that we show in INFO commandstats. */
+    // 如果需要，将命令加入慢日志，统计命令热度等信息
     if (flags & CMD_CALL_SLOWLOG && !(c->cmd->flags & CMD_SKIP_SLOWLOG)) {
         char *latency_event = (c->cmd->flags & CMD_FAST) ?
                               "fast-command" : "command";
@@ -3311,11 +3367,13 @@ void call(client *c, int flags) {
         /* use the real command that was executed (cmd and lastamc) may be
          * different, in case of MULTI-EXEC or re-written commands such as
          * EXPIRE, GEOADD, etc. */
+        //计算命令的统计数据
         real_cmd->microseconds += duration;
         real_cmd->calls++;
     }
 
     /* Propagate the command into the AOF and replication link */
+    // 命令的复制和向AOF传播
     if (flags & CMD_CALL_PROPAGATE &&
         (c->flags & CLIENT_PREVENT_PROP) != CLIENT_PREVENT_PROP)
     {
@@ -3323,10 +3381,12 @@ void call(client *c, int flags) {
 
         /* Check if the command operated changes in the data set. If so
          * set for replication / AOF propagation. */
+        //检查命令操作是否改变数据，若是则进行传播向aof追加和复制（主从or集群）
         if (dirty) propagate_flags |= (PROPAGATE_AOF|PROPAGATE_REPL);
 
         /* If the client forced AOF / replication of the command, set
          * the flags regardless of the command effects on the data set. */
+        //如果客户端强制命令向aof追加写入/节点复制，则重置flags为能影响数据的命令
         if (c->flags & CLIENT_FORCE_REPL) propagate_flags |= PROPAGATE_REPL;
         if (c->flags & CLIENT_FORCE_AOF) propagate_flags |= PROPAGATE_AOF;
 
@@ -3343,12 +3403,14 @@ void call(client *c, int flags) {
         /* Call propagate() only if at least one of AOF / replication
          * propagation is needed. Note that modules commands handle replication
          * in an explicit way, so we never replicate them automatically. */
+        //调用传播方法 这里面是写aof和节点复制的操作
         if (propagate_flags != PROPAGATE_NONE && !(c->cmd->flags & CMD_MODULE))
             propagate(c->cmd,c->db->id,c->argv,c->argc,propagate_flags);
     }
 
     /* Restore the old replication flags, since call() can be executed
      * recursively. */
+    //恢复旧的复制标志（原因是可能执行命令的递归调用）
     c->flags &= ~(CLIENT_FORCE_AOF|CLIENT_FORCE_REPL|CLIENT_PREVENT_PROP);
     c->flags |= client_old_flags &
         (CLIENT_FORCE_AOF|CLIENT_FORCE_REPL|CLIENT_PREVENT_PROP);
@@ -3461,6 +3523,8 @@ int processCommand(client *c) {
      * go through checking for replication and QUIT will cause trouble
      * when FORCE_REPLICATION is enabled and would be implemented in
      * a regular command proc. */
+    /* 在这个调用流程上，如果processCommand返回了REDIS_OK，client会被reset掉，
+     * 所以这里只是打上REDIS_CLOSE_AFTER_REPLY的标记并返回REDIS_ERR */
     if (!strcasecmp(c->argv[0]->ptr,"quit")) {
         addReply(c,shared.ok);
         c->flags |= CLIENT_CLOSE_AFTER_REPLY;
@@ -3470,6 +3534,10 @@ int processCommand(client *c) {
     /* Now lookup the command and check ASAP about trivial error conditions
      * such as wrong arity, bad command name and so forth. */
     c->cmd = c->lastcmd = lookupCommand(c->argv[0]->ptr);
+    /*
+     * 由于一次只会处理一条命令，所以c->cmd->arity大于0的话则一定会等于c->argc
+     * 如果arity小于0，说明该命令的参数个数至少是-arity个
+     */
     if (!c->cmd) {
         sds args = sdsempty();
         int i;
@@ -3543,9 +3611,10 @@ int processCommand(client *c) {
                                         &hashslot,&error_code);
         if (n == NULL || n != server.cluster->myself) {
             if (c->cmd->proc == execCommand) {
-                discardTransaction(c);
+                discardTransaction(c); /* 撤销事务操作 */
             } else {
                 flagTransaction(c);
+                /* 标记事务为DIRTY_EXEC状态，最后这个事物会运行失败。。此方法调用于插入命令的时候 */
             }
             clusterRedirectClient(c,n,hashslot,error_code);
             return C_OK;
@@ -3689,10 +3758,10 @@ int processCommand(client *c) {
         c->cmd->proc != execCommand && c->cmd->proc != discardCommand &&
         c->cmd->proc != multiCommand && c->cmd->proc != watchCommand)
     {
-        queueMultiCommand(c);
+        queueMultiCommand(c);  //事务
         addReply(c,shared.queued);
     } else {
-        call(c,CMD_CALL_FULL);
+        call(c,CMD_CALL_FULL); //真正调用处理命令的方法。比如setCommand getCommand
         c->woff = server.master_repl_offset;
         if (listLength(server.ready_keys))
             handleClientsBlockedOnKeys();
@@ -4904,14 +4973,26 @@ int checkForSentinelMode(int argc, char **argv) {
 }
 
 /* Function called at startup to load RDB or AOF file in memory. */
+/*
+ * 在启动时，会检查aof和rdb选项是否打开，如果打开，则会去加载数据。
+ * 这里要注意的是，redis总是先查看是否有 aof 开关是否打开；打开的话，则直接使用 aof；
+ * 如果 aof 没打开，则去加载 rdb 文件。
+ * aof主要通过检查是否含有RDB前缀文件，如果有则加载，创建一个FakeClient一条条的执行AOF文件中的指令 。
+ * 特别地，事务会单独加载。
+ * rdb redis抽象出一个rio层，负责处理IO操作的，通过rio进行rdb文件恢复redis（快照保存的逆操作）。
+ */
 void loadDataFromDisk(void) {
     long long start = ustime();
+    // AOF 持久化已打开
     if (server.aof_state == AOF_ON) {
+        // 尝试载入 AOF 文件
         if (loadAppendOnlyFile(server.aof_filename) == C_OK)
+            // 打印载入信息，并计算载入耗时长度
             serverLog(LL_NOTICE,"DB loaded from append only file: %.3f seconds",(float)(ustime()-start)/1000000);
     } else {
         rdbSaveInfo rsi = RDB_SAVE_INFO_INIT;
         errno = 0; /* Prevent a stale value from affecting error checking */
+        // 尝试载入 RDB 文件
         if (rdbLoad(server.rdb_filename,&rsi,RDBFLAGS_NONE) == C_OK) {
             serverLog(LL_NOTICE,"DB loaded from disk: %.3f seconds",
                 (float)(ustime()-start)/1000000);
@@ -5174,7 +5255,8 @@ int main(int argc, char **argv) {
         loadServerConfig(configfile,options);
         sdsfree(options);
     }
-
+    serverLog(LL_WARNING, "yryryryryryr Redis is starting whooooooooooooo");
+    serverLog(LL_WARNING, "learn Redis");
     serverLog(LL_WARNING, "oO0OoO0OoO0Oo Redis is starting oO0OoO0OoO0Oo");
     serverLog(LL_WARNING,
         "Redis version=%s, bits=%d, commit=%s, modified=%d, pid=%d, just started",
@@ -5195,6 +5277,11 @@ int main(int argc, char **argv) {
     if (background) daemonize();
 
     initServer();
+    /*
+     *  # When running daemonized, Redis writes a pid file in /var/run/redis.pid by
+        # default. You can specify a custom pid file location here.
+        pidfile /var/run/redis.pid
+     */
     if (background || server.pidfile) createPidFile();
     redisSetProcTitle(argv[0]);
     redisAsciiArt();
@@ -5209,7 +5296,8 @@ int main(int argc, char **argv) {
         moduleInitModulesSystemLast();
         moduleLoadFromQueue();
         ACLLoadUsersAtStartup();
-        InitServerLast();
+        InitServerLast(); //这里会初始化 多线程io
+        //加载aof或者rdb
         loadDataFromDisk();
         if (server.cluster_enabled) {
             if (verifyClusterConfigWithData() == C_ERR) {
@@ -5232,7 +5320,7 @@ int main(int argc, char **argv) {
             }
         }
     } else {
-        InitServerLast();
+        InitServerLast(); //这里会初始化 多线程io
         sentinelIsRunning();
         if (server.supervised_mode == SUPERVISED_SYSTEMD) {
             redisCommunicateSystemd("STATUS=Ready to accept connections\n");

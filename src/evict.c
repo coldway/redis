@@ -205,6 +205,7 @@ void evictionPoolPopulate(int dbid, dict *sampledict, dict *keydict, struct evic
         /* Insert the element inside the pool.
          * First, find the first empty bucket or the first populated
          * bucket that has an idle time smaller than our idle time. */
+        // 找在pool里的位置
         k = 0;
         while (k < EVPOOL_SIZE &&
                pool[k].key &&

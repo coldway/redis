@@ -58,16 +58,21 @@
 /* ------------------------- Buffer I/O implementation ----------------------- */
 
 /* Returns 1 or 0 for success/failure. */
+/* 将buf中指定长度len的内容追加到rio对象的缓冲区中，操作成功返回1，否则返回0。*/
 static size_t rioBufferWrite(rio *r, const void *buf, size_t len) {
+    // 调用sdscatlen实现append操作
     r->io.buffer.ptr = sdscatlen(r->io.buffer.ptr,(char*)buf,len);
     r->io.buffer.pos += len;
     return 1;
 }
 
 /* Returns 1 or 0 for success/failure. */
+/* 从rio对象的缓冲区中读取长度为len的内容到buf中，操作成功返回1，否则返回0。*/
 static size_t rioBufferRead(rio *r, void *buf, size_t len) {
+    // 如果rio对象的缓冲区中内容的长度小于len，读取失败
     if (sdslen(r->io.buffer.ptr)-r->io.buffer.pos < len)
         return 0; /* not enough buffer to return len bytes. */
+    // 将缓冲区中的内容复制到buf
     memcpy(buf,r->io.buffer.ptr+r->io.buffer.pos,len);
     r->io.buffer.pos += len;
     return 1;

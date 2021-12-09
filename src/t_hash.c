@@ -205,7 +205,7 @@ int hashTypeSet(robj *o, sds field, sds value, int flags) {
     if (o->encoding == OBJ_ENCODING_ZIPLIST) {
         unsigned char *zl, *fptr, *vptr;
 
-        zl = o->ptr;
+        zl = o->ptr;  //在createobject时已经将外部的zl注入到改结构体中
         fptr = ziplistIndex(zl, ZIPLIST_HEAD);
         if (fptr != NULL) {
             fptr = ziplistFind(fptr, (unsigned char*)field, sdslen(field), 1);

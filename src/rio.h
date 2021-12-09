@@ -44,37 +44,53 @@ struct _rio {
     /* Backend functions.
      * Since this functions do not tolerate short writes or reads the return
      * value is simplified to: zero on error, non zero on complete success. */
+    /*  后端方法：函数的返回值为0表示发生错误，返回值为非0表示操作成功。 */
+
+    // 数据流读操作
     size_t (*read)(struct _rio *, void *buf, size_t len);
+    // 数据流写操作
     size_t (*write)(struct _rio *, const void *buf, size_t len);
+    // 读或写操作的当前偏移量
     off_t (*tell)(struct _rio *);
+    // flush操作
     int (*flush)(struct _rio *);
     /* The update_cksum method if not NULL is used to compute the checksum of
      * all the data that was read or written so far. The method should be
      * designed so that can be called with the current checksum, and the buf
      * and len fields pointing to the new block of data to add to the checksum
      * computation. */
+    // 更新校验和
     void (*update_cksum)(struct _rio *, const void *buf, size_t len);
 
     /* The current checksum and flags (see RIO_FLAG_*) */
     uint64_t cksum, flags;
 
     /* number of bytes read or written */
+    // 已读或已写的字节数
     size_t processed_bytes;
 
     /* maximum single read or write chunk size */
+    // 每次读或写操作的最大字节数
     size_t max_processing_chunk;
 
     /* Backend-specific vars. */
+    // io变量
     union {
         /* In-memory buffer target. */
+        // 内存缓冲区buffer结构体
         struct {
+            // buffer中的内容，实际就是char数组
             sds ptr;
+            // 偏移量
             off_t pos;
         } buffer;
         /* Stdio file pointer target. */
         struct {
+            // 文件结构体
             FILE *fp;
+            // 最后一个fsync后写入的字节数
             off_t buffered; /* Bytes written since last fsync. */
+            // 多少字节进行一次fsync操作
             off_t autosync; /* fsync after 'autosync' bytes written. */
         } file;
         /* Connection object (used to read from socket) */
@@ -103,14 +119,19 @@ typedef struct _rio rio;
 static inline size_t rioWrite(rio *r, const void *buf, size_t len) {
     if (r->flags & RIO_FLAG_WRITE_ERROR) return 0;
     while (len) {
+        // 判断当前要求写入的字节数是否操作了max_processing_chunk规定的最大长度
         size_t bytes_to_write = (r->max_processing_chunk && r->max_processing_chunk < len) ? r->max_processing_chunk : len;
+        // 写入新的数据时，更新校验和字段
         if (r->update_cksum) r->update_cksum(r,buf,bytes_to_write);
+        // 调用write方法执行写入操作
         if (r->write(r,buf,bytes_to_write) == 0) {
             r->flags |= RIO_FLAG_WRITE_ERROR;
             return 0;
         }
+        // 更新buf下次写入的位置
         buf = (char*)buf + bytes_to_write;
         len -= bytes_to_write;
+        // 更新已写入的字节数
         r->processed_bytes += bytes_to_write;
     }
     return 1;

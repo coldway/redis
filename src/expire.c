@@ -142,7 +142,9 @@ void activeExpireCycle(int type) {
     static long long last_fast_cycle = 0; /* When last fast cycle ran. */
 
     int j, iteration = 0;
+    // 默认每次处理的数据库数量
     int dbs_per_call = CRON_DBS_PER_CALL;
+    // 函数开始的时间
     long long start = ustime(), timelimit, elapsed;
 
     /* When clients are paused the dataset should be static not just from the
@@ -192,10 +194,11 @@ void activeExpireCycle(int type) {
     long total_sampled = 0;
     long total_expired = 0;
 
+    // 1 遍历数据库
     for (j = 0; j < dbs_per_call && timelimit_exit == 0; j++) {
         /* Expired and checked in a single loop. */
         unsigned long expired, sampled;
-
+        // 指向要处理的数据库
         redisDb *db = server.db+(current_db % server.dbnum);
 
         /* Increment the DB now so we are sure if we run out of time
@@ -214,11 +217,14 @@ void activeExpireCycle(int type) {
             iteration++;
 
             /* If there is nothing to expire try next DB ASAP. */
+            // 2 获取数据库中带过期时间的键的数量 如果该数量为 0 ，直接跳过这个数据库
             if ((num = dictSize(db->expires)) == 0) {
                 db->avg_ttl = 0;
                 break;
             }
+            // 3 获取数据库中键值对的数量
             slots = dictSlots(db->expires);
+            // 当前时间
             now = mstime();
 
             /* When there are less than 1% filled slots, sampling the key
@@ -233,7 +239,7 @@ void activeExpireCycle(int type) {
             sampled = 0;
             ttl_sum = 0;
             ttl_samples = 0;
-
+            // 每次最多只能检查 LOOKUPS_PER_LOOP 个键
             if (num > config_keys_per_loop)
                 num = config_keys_per_loop;
 
@@ -266,7 +272,7 @@ void activeExpireCycle(int type) {
                          * deleted. */
                         dictEntry *e = de;
                         de = de->next;
-
+                        // 计算 TTL
                         ttl = dictGetSignedIntegerVal(e)-now;
                         if (activeExpireCycleTryExpire(db,e,now)) expired++;
                         if (ttl > 0) {

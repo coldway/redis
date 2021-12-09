@@ -114,10 +114,12 @@ typedef struct clusterNode {
     char name[CLUSTER_NAMELEN]; /* Node name, hex string, sha1-size */
     int flags;      /* CLUSTER_NODE_... */
     uint64_t configEpoch; /* Last configEpoch observed for this node */
+    // 代表节点负责的哈希槽
     unsigned char slots[CLUSTER_SLOTS/8]; /* slots handled by this node */
     int numslots;   /* Number of slots handled by this node */
     int numslaves;  /* Number of slave nodes, if this is a master */
     struct clusterNode **slaves; /* pointers to slave nodes */
+    // 如果当前节点是从节点，则存储其主从复制的主节点
     struct clusterNode *slaveof; /* pointer to the master node. Note that it
                                     may be NULL even if the node is a slave
                                     if we don't have the master node in our
@@ -134,6 +136,7 @@ typedef struct clusterNode {
     int port;                   /* Latest known clients port of this node */
     int cport;                  /* Latest known cluster port of this node. */
     clusterLink *link;          /* TCP/IP link with this node */
+    // 报告此节点宕机的节点列表
     list *fail_reports;         /* List of nodes signaling this as failing */
 } clusterNode;
 
@@ -144,16 +147,24 @@ typedef struct clusterState {
     int size;             /* Num of master nodes with at least one slot */
     dict *nodes;          /* Hash table of name -> clusterNode structures */
     dict *nodes_black_list; /* Nodes we don't re-add for a few seconds. */
+    // 正在执行迁出的哈希槽及目标节点
     clusterNode *migrating_slots_to[CLUSTER_SLOTS];
+    // 正在执行导入的哈希槽及源节点
     clusterNode *importing_slots_from[CLUSTER_SLOTS];
+    // 哈希槽与节点的映射关系
     clusterNode *slots[CLUSTER_SLOTS];
+    // 每个哈希槽中存储key的数量
     uint64_t slots_keys_count[CLUSTER_SLOTS];
     rax *slots_to_keys;
     /* The following fields are used to take the slave state on elections. */
+    // 故障转移授权时间
     mstime_t failover_auth_time; /* Time of previous or next election. */
+    // 故障转移获得投票数
     int failover_auth_count;    /* Number of votes received so far. */
+    // 是否发起投票
     int failover_auth_sent;     /* True if we already asked for votes. */
     int failover_auth_rank;     /* This slave rank for current auth request. */
+    // 当前故障转移的配置纪元
     uint64_t failover_auth_epoch; /* Epoch of the current election. */
     int cant_failover_reason;   /* Why a slave is currently not able to
                                    failover. See the CANT_FAILOVER_* macros. */
@@ -168,11 +179,13 @@ typedef struct clusterState {
     int mf_can_start;           /* If non-zero signal that the manual failover
                                    can start requesting masters vote. */
     /* The followign fields are used by masters to take state on elections. */
+    // 最近一次投票的配置纪元
     uint64_t lastVoteEpoch;     /* Epoch of the last vote granted. */
     int todo_before_sleep; /* Things to do in clusterBeforeSleep(). */
     /* Messages received and sent by type. */
     long long stats_bus_messages_sent[CLUSTERMSG_TYPE_COUNT];
     long long stats_bus_messages_received[CLUSTERMSG_TYPE_COUNT];
+    // 达到PFAIL的节点数量
     long long stats_pfail_nodes;    /* Number of nodes in PFAIL status,
                                        excluding nodes without address. */
 } clusterState;
@@ -183,17 +196,26 @@ typedef struct clusterState {
  * to the first node, using the getsockname() function. Then we'll use this
  * address for all the next messages. */
 typedef struct {
+    // 节点ID
     char nodename[CLUSTER_NAMELEN];
+    // 消息发送节点对该节点最近一次发送ping请求的时间
     uint32_t ping_sent;
+    // 消息发送节点从该节点最近一次接收pong回复的时间
     uint32_t pong_received;
+    // 节点IP
     char ip[NET_IP_STR_LEN];  /* IP address last time it was seen */
+    // 对外服务端口
     uint16_t port;              /* base port last time it was seen */
+    // 集群总线端口
     uint16_t cport;             /* cluster port last time it was seen */
+    // 在消息发送节点视角该节点的状态
     uint16_t flags;             /* node->flags copy */
+    // 预留字段
     uint32_t notused1;
 } clusterMsgDataGossip;
 
 typedef struct {
+    // 发生故障节点的名称
     char nodename[CLUSTER_NAMELEN];
 } clusterMsgDataFail;
 
@@ -218,12 +240,14 @@ typedef struct {
 
 union clusterMsgData {
     /* PING, MEET and PONG */
+    /*用于 PING, MEET and PONG三种类型消息 */
     struct {
         /* Array of N clusterMsgDataGossip structures */
         clusterMsgDataGossip gossip[1];
     } ping;
 
     /* FAIL */
+    /* 用于广播节点故障 FAIL */
     struct {
         clusterMsgDataFail about;
     } fail;
@@ -234,6 +258,7 @@ union clusterMsgData {
     } publish;
 
     /* UPDATE */
+    /* 用于广播节点哈希槽最新状态UPDATE */
     struct {
         clusterMsgDataUpdate nodecfg;
     } update;
@@ -247,27 +272,39 @@ union clusterMsgData {
 #define CLUSTER_PROTO_VER 1 /* Cluster bus protocol version. */
 
 typedef struct {
+    // 固定消息头，魔数“RCmb”
     char sig[4];        /* Signature "RCmb" (Redis Cluster message bus). */
     uint32_t totlen;    /* Total length of this message */
     uint16_t ver;       /* Protocol version, currently set to 1. */
     uint16_t port;      /* TCP base port number. */
     uint16_t type;      /* Message type */
     uint16_t count;     /* Only used for some kind of messages. */
+    // 从发送消息的节点来看，当前集群纪元
     uint64_t currentEpoch;  /* The epoch accordingly to the sending node. */
+    // 发送消息节点的配置纪元或其主节点的配置纪元
     uint64_t configEpoch;   /* The config epoch if it's a master, or the last
                                epoch advertised by its master if it is a
                                slave. */
+    // 复制偏移量：对于主节点，是命令传播的复制偏移量；对于从节点，是已处理的来自其主节点的复制偏移
     uint64_t offset;    /* Master replication offset if node is a master or
                            processed replication offset if node is a slave. */
+    // 发送消息节点的名称/ID
     char sender[CLUSTER_NAMELEN]; /* Name of the sender node */
+    // 发送消息节点负责的哈希槽
     unsigned char myslots[CLUSTER_SLOTS/8];
+    // 如果是从节点，该字段放置其主节点的节点名称/ID
     char slaveof[CLUSTER_NAMELEN];
+    // 发送消息节点的IP
     char myip[NET_IP_STR_LEN];    /* Sender IP, if not all zeroed. */
     char notused1[34];  /* 34 bytes reserved for future usage. */
+    // 集群总线监听端口
     uint16_t cport;      /* Sender TCP cluster bus port */
+    // 发送消息节点的状态
     uint16_t flags;      /* Sender node flags */
+    // 从发送消息节点的视角来看，当前集群的状态，OK or FAIL
     unsigned char state; /* Cluster state from the POV of the sender */
     unsigned char mflags[3]; /* Message flags: CLUSTERMSG_FLAG[012]_... */
+    // 消息体，根据上面消息类型type，决定该字段存放什么内容
     union clusterMsgData data;
 } clusterMsg;
 

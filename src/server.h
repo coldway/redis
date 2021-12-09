@@ -860,8 +860,11 @@ typedef struct client {
     char buf[PROTO_REPLY_CHUNK_BYTES];
 } client;
 
+// RDB 保存策略 结构
 struct saveparam {
+    // 时间要求
     time_t seconds;
+    // 修改次数要求
     int changes;
 };
 
@@ -1231,17 +1234,17 @@ struct redisServer {
                                       to child process. */
     sds aof_child_diff;             /* AOF diff accumulator child side. */
     /* RDB persistence */
-    long long dirty;                /* Changes to DB from the last save */
-    long long dirty_before_bgsave;  /* Used to restore dirty on failed BGSAVE */
+    long long dirty;                /* Changes to DB from the last save */// 数据保存记录，dirty 用来存储上次保存前所有数据变动的长度，用于以后判断在执行命令的过程中是否有了db中数据的变化，用得到的结果来判断要不要执行持久化操作
+    long long dirty_before_bgsave;  /* Used to restore dirty on failed BGSAVE */// 上次持久化操作时 dirty 数据
     pid_t rdb_child_pid;            /* PID of RDB saving child */
-    struct saveparam *saveparams;   /* Save points array for RDB */
-    int saveparamslen;              /* Number of saving points */
+    struct saveparam *saveparams;   /* Save points array for RDB */// 保存 RDB 策略信息数组，数组每个元素都是一个 saveparam 结构，保存一组 save 选项设置
+    int saveparamslen;              /* Number of saving points */    // 策略个数
     char *rdb_filename;             /* Name of RDB file */
     int rdb_compression;            /* Use compression in RDB? */
     int rdb_checksum;               /* Use RDB checksum? */
     int rdb_del_sync_files;         /* Remove RDB files used only for SYNC if
                                        the instance does not use persistence. */
-    time_t lastsave;                /* Unix time of last successful save */
+    time_t lastsave;                /* Unix time of last successful save */// 上一次保存时间
     time_t lastbgsave_try;          /* Unix time of last attempted bgsave */
     time_t rdb_save_time_last;      /* Time used by last RDB save run. */
     time_t rdb_save_time_start;     /* Current RDB save start time. */

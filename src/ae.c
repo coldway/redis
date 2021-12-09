@@ -226,17 +226,25 @@ long long aeCreateTimeEvent(aeEventLoop *eventLoop, long long milliseconds,
         aeTimeProc *proc, void *clientData,
         aeEventFinalizerProc *finalizerProc)
 {
+    // 更新时间计数器
     long long id = eventLoop->timeEventNextId++;
+    // 创建时间事件结构
     aeTimeEvent *te;
 
     te = zmalloc(sizeof(*te));
-    if (te == NULL) return AE_ERR;
+    if (te == NULL) return AE_ERR; //事件执行状态：出错
+    // 设置 ID
     te->id = id;
+    // 设定处理事件的时间
     aeAddMillisecondsToNow(milliseconds,&te->when_sec,&te->when_ms);
+    // 设置事件处理器
     te->timeProc = proc;
+    //设置事件释放函数
     te->finalizerProc = finalizerProc;
+    // 设置私有数据
     te->clientData = clientData;
     te->prev = NULL;
+    // 将新事件放入表尾。这是个双向链表
     te->next = eventLoop->timeEventHead;
     te->refcount = 0;
     if (te->next)
@@ -245,6 +253,9 @@ long long aeCreateTimeEvent(aeEventLoop *eventLoop, long long milliseconds,
     return id;
 }
 
+/*
+ * 这里实际上是个软删除，只是把id置成了-1
+ */
 int aeDeleteTimeEvent(aeEventLoop *eventLoop, long long id)
 {
     aeTimeEvent *te = eventLoop->timeEventHead;
@@ -299,6 +310,11 @@ static int processTimeEvents(aeEventLoop *eventLoop) {
      * events to be processed ASAP when this happens: the idea is that
      * processing events earlier is less dangerous than delaying them
      * indefinitely, and practice suggests it is. */
+    // 如果系统时钟被移动到未来，然后返回到正确的值，那么时间事件可能会以一种随机的方式延迟。通常这意味着计划的操作不会很快执行。
+    // 在这里，我们试图检测系统时钟的倾斜，并在发生这种情况时强制所有的时间事件被处理。
+    // 早期处理事件比无限期地延迟它们的危险要小
+    // 通过重置事件的运行时间，
+    // 防止因时间穿插（skew）而造成的事件处理混乱
     if (now < eventLoop->lastTime) {
         te = eventLoop->timeEventHead;
         while(te) {
@@ -306,6 +322,7 @@ static int processTimeEvents(aeEventLoop *eventLoop) {
             te = te->next;
         }
     }
+    // 更新最后一次处理时间事件的时间
     eventLoop->lastTime = now;
 
     te = eventLoop->timeEventHead;
@@ -315,6 +332,7 @@ static int processTimeEvents(aeEventLoop *eventLoop) {
         long long id;
 
         /* Remove events scheduled for deletion. */
+        //因为前面的删除都是软删除，所以在处理的时候统一删除
         if (te->id == AE_DELETED_EVENT_ID) {
             aeTimeEvent *next = te->next;
             /* If a reference exists for this timer event,
@@ -342,11 +360,14 @@ static int processTimeEvents(aeEventLoop *eventLoop) {
          * add new timers on the head, however if we change the implementation
          * detail, this check may be useful again: we keep it here for future
          * defense. */
+        // 跳过无效事件
         if (te->id > maxId) {
             te = te->next;
             continue;
         }
+        // 获取当前时间
         aeGetTime(&now_sec, &now_ms);
+        // 如果当前时间等于或等于事件的执行时间，那么说明事件已到达，执行这个事件
         if (now_sec > te->when_sec ||
             (now_sec == te->when_sec && now_ms >= te->when_ms))
         {
@@ -354,12 +375,16 @@ static int processTimeEvents(aeEventLoop *eventLoop) {
 
             id = te->id;
             te->refcount++;
+            // 执行事件处理器，并获取返回值
             retval = te->timeProc(eventLoop, id, te->clientData);
             te->refcount--;
             processed++;
+            // 记录是否有需要循环执行这个事件时间
             if (retval != AE_NOMORE) {
+                // 是的， retval 毫秒之后继续执行这个时间事件
                 aeAddMillisecondsToNow(retval,&te->when_sec,&te->when_ms);
             } else {
+                // 否，将这个事件删除
                 te->id = AE_DELETED_EVENT_ID;
             }
         }
@@ -399,10 +424,12 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
         int j;
         aeTimeEvent *shortest = NULL;
         struct timeval tv, *tvp;
-
+        // 获取最近的时间事件
         if (flags & AE_TIME_EVENTS && !(flags & AE_DONT_WAIT))
             shortest = aeSearchNearestTimer(eventLoop);
         if (shortest) {
+            // 如果时间事件存在的话
+            // 那么根据最近可执行时间事件和现在时间的时间差来决定文件事件的阻塞时间
             long now_sec, now_ms;
 
             aeGetTime(&now_sec, &now_ms);
@@ -422,14 +449,18 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
                 tvp->tv_usec = 0;
             }
         } else {
+            // 执行到这一步，说明没有时间事件
+            // 那么根据 AE_DONT_WAIT 是否设置来决定是否阻塞，以及阻塞的时间长度
             /* If we have to check for events but need to return
              * ASAP because of AE_DONT_WAIT we need to set the timeout
              * to zero */
             if (flags & AE_DONT_WAIT) {
+                // 设置文件事件不阻塞
                 tv.tv_sec = tv.tv_usec = 0;
                 tvp = &tv;
             } else {
                 /* Otherwise we can block */
+                // 文件事件可以阻塞直到有事件到达为止
                 tvp = NULL; /* wait forever */
             }
         }
@@ -505,6 +536,7 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
         }
     }
     /* Check time events */
+    // 执行时间事件
     if (flags & AE_TIME_EVENTS)
         processed += processTimeEvents(eventLoop);
 
