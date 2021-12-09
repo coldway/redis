@@ -36,9 +36,9 @@
 
 /* Count number of bits set in the binary array pointed by 's' and long
  * 'count' bytes. The implementation of this function is required to
- * work with a input string length up to 512 MB. */
-size_t redisPopcount(void *s, long count) {
-    size_t bits = 0;
+ * work with an input string length up to 512 MB or more (server.proto_max_bulk_len) */
+long long redisPopcount(void *s, long count) {
+    long long bits = 0;
     unsigned char *p = s;
     uint32_t *p4;
     static const unsigned char bitsinbyte[256] = {0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4,1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5,1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5,2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5,2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5,2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,4,5,5,6,5,6,6,7,5,6,6,7,6,7,7,8};
@@ -98,16 +98,16 @@ size_t redisPopcount(void *s, long count) {
  * no zero bit is found, it returns count*8 assuming the string is zero
  * padded on the right. However if 'bit' is 1 it is possible that there is
  * not a single set bit in the bitmap. In this special case -1 is returned. */
-long redisBitpos(void *s, unsigned long count, int bit) {
+long long redisBitpos(void *s, unsigned long count, int bit) {
     unsigned long *l;
     unsigned char *c;
     unsigned long skipval, word = 0, one;
-    long pos = 0; /* Position of bit, to return to the caller. */
+    long long pos = 0; /* Position of bit, to return to the caller. */
     unsigned long j;
     int found;
 
     /* Process whole words first, seeking for first word that is not
-     * all ones or all zeros respectively if we are lookig for zeros
+     * all ones or all zeros respectively if we are looking for zeros
      * or ones. This is much faster with large strings having contiguous
      * blocks of 1 or 0 bits compared to the vanilla bit per bit processing.
      *
@@ -405,12 +405,12 @@ void printBits(unsigned char *p, unsigned long count) {
 
 /* This helper function used by GETBIT / SETBIT parses the bit offset argument
  * making sure an error is returned if it is negative or if it overflows
- * Redis 512 MB limit for the string value.
+ * Redis 512 MB limit for the string value or more (server.proto_max_bulk_len).
  *
  * If the 'hash' argument is true, and 'bits is positive, then the command
  * will also parse bit offsets prefixed by "#". In such a case the offset
  * is multiplied by 'bits'. This is useful for the BITFIELD command. */
-int getBitOffsetFromArgument(client *c, robj *o, size_t *offset, int hash, int bits) {
+int getBitOffsetFromArgument(client *c, robj *o, uint64_t *offset, int hash, int bits) {
     long long loffset;
     char *err = "bit offset is not an integer or out of range";
     char *p = o->ptr;
@@ -428,14 +428,14 @@ int getBitOffsetFromArgument(client *c, robj *o, size_t *offset, int hash, int b
     /* Adjust the offset by 'bits' for #<offset> form. */
     if (usehash) loffset *= bits;
 
-    /* Limit offset to 512MB in bytes */
-    if ((loffset < 0) || ((unsigned long long)loffset >> 3) >= (512*1024*1024))
+    /* Limit offset to server.proto_max_bulk_len (512MB in bytes by default) */
+    if ((loffset < 0) || (loffset >> 3) >= server.proto_max_bulk_len)
     {
         addReplyError(c,err);
         return C_ERR;
     }
 
-    *offset = (size_t)loffset;
+    *offset = loffset;
     return C_OK;
 }
 
@@ -477,15 +477,15 @@ int getBitfieldTypeFromArgument(client *c, robj *o, int *sign, int *bits) {
  * so that the 'maxbit' bit can be addressed. The object is finally
  * returned. Otherwise if the key holds a wrong type NULL is returned and
  * an error is sent to the client. */
-robj *lookupStringForBitCommand(client *c, size_t maxbit) {
+robj *lookupStringForBitCommand(client *c, uint64_t maxbit) {
     size_t byte = maxbit >> 3;
     robj *o = lookupKeyWrite(c->db,c->argv[1]);
+    if (checkType(c,o,OBJ_STRING)) return NULL;
 
     if (o == NULL) {
         o = createObject(OBJ_STRING,sdsnewlen(NULL, byte+1));
         dbAdd(c->db,c->argv[1],o);
     } else {
-        if (checkType(c,o,OBJ_STRING)) return NULL;
         o = dbUnshareStringValue(c->db,c->argv[1],o);
         o->ptr = sdsgrowzero(o->ptr,byte+1);
     }
@@ -496,7 +496,7 @@ robj *lookupStringForBitCommand(client *c, size_t maxbit) {
  * in 'len'. The user is required to pass (likely stack allocated) buffer
  * 'llbuf' of at least LONG_STR_SIZE bytes. Such a buffer is used in the case
  * the object is integer encoded in order to provide the representation
- * without usign heap allocation.
+ * without using heap allocation.
  *
  * The function returns the pointer to the object array of bytes representing
  * the string it contains, that may be a pointer to 'llbuf' or to the
@@ -527,7 +527,7 @@ unsigned char *getObjectReadOnlyString(robj *o, long *len, char *llbuf) {
 void setbitCommand(client *c) {
     robj *o;
     char *err = "bit is not an integer or out of range";
-    size_t bitoffset;
+    uint64_t bitoffset;
     ssize_t byte, bit;
     int byteval, bitval;
     long on;
@@ -566,7 +566,7 @@ void setbitCommand(client *c) {
 void getbitCommand(client *c) {
     robj *o;
     char llbuf[32];
-    size_t bitoffset;
+    uint64_t bitoffset;
     size_t byte, bit;
     size_t bitval = 0;
 
@@ -611,7 +611,7 @@ void bitopCommand(client *c) {
     else if((opname[0] == 'n' || opname[0] == 'N') && !strcasecmp(opname,"not"))
         op = BITOP_NOT;
     else {
-        addReply(c,shared.syntaxerr);
+        addReplyErrorObject(c,shared.syntaxerr);
         return;
     }
 
@@ -735,11 +735,22 @@ void bitopCommand(client *c) {
             output = (len[0] <= j) ? 0 : src[0][j];
             if (op == BITOP_NOT) output = ~output;
             for (i = 1; i < numkeys; i++) {
+                int skip = 0;
                 byte = (len[i] <= j) ? 0 : src[i][j];
                 switch(op) {
-                case BITOP_AND: output &= byte; break;
-                case BITOP_OR:  output |= byte; break;
+                case BITOP_AND:
+                    output &= byte;
+                    skip = (output == 0);
+                    break;
+                case BITOP_OR:
+                    output |= byte;
+                    skip = (output == 0xff);
+                    break;
                 case BITOP_XOR: output ^= byte; break;
+                }
+
+                if (skip) {
+                    break;
                 }
             }
             res[j] = output;
@@ -802,7 +813,7 @@ void bitcountCommand(client *c) {
         end = strlen-1;
     } else {
         /* Syntax error. */
-        addReply(c,shared.syntaxerr);
+        addReplyErrorObject(c,shared.syntaxerr);
         return;
     }
 
@@ -867,7 +878,7 @@ void bitposCommand(client *c) {
         end = strlen-1;
     } else {
         /* Syntax error. */
-        addReply(c,shared.syntaxerr);
+        addReplyErrorObject(c,shared.syntaxerr);
         return;
     }
 
@@ -877,7 +888,7 @@ void bitposCommand(client *c) {
         addReplyLongLong(c, -1);
     } else {
         long bytes = end-start+1;
-        long pos = redisBitpos(p+start,bytes,bit);
+        long long pos = redisBitpos(p+start,bytes,bit);
 
         /* If we are looking for clear bits, and the user specified an exact
          * range with start-end, we can't consider the right of the range as
@@ -886,11 +897,11 @@ void bitposCommand(client *c) {
          * So if redisBitpos() returns the first bit outside the range,
          * we return -1 to the caller, to mean, in the specified range there
          * is not a single "0" bit. */
-        if (end_given && bit == 0 && pos == bytes*8) {
+        if (end_given && bit == 0 && pos == (long long)bytes<<3) {
             addReplyLongLong(c,-1);
             return;
         }
-        if (pos != -1) pos += start*8; /* Adjust for the bytes we skipped. */
+        if (pos != -1) pos += (long long)start<<3; /* Adjust for the bytes we skipped. */
         addReplyLongLong(c,pos);
     }
 }
@@ -922,12 +933,12 @@ struct bitfieldOp {
  * GET subcommand is allowed, other subcommands will return an error. */
 void bitfieldGeneric(client *c, int flags) {
     robj *o;
-    size_t bitoffset;
+    uint64_t bitoffset;
     int j, numops = 0, changes = 0;
     struct bitfieldOp *ops = NULL; /* Array of ops to execute at end. */
     int owtype = BFOVERFLOW_WRAP; /* Overflow type. */
     int readonly = 1;
-    size_t highest_write_offset = 0;
+    uint64_t highest_write_offset = 0;
 
     for (j = 2; j < c->argc; j++) {
         int remargs = c->argc-j-1; /* Remaining args other than current. */
@@ -959,7 +970,7 @@ void bitfieldGeneric(client *c, int flags) {
             }
             continue;
         } else {
-            addReply(c,shared.syntaxerr);
+            addReplyErrorObject(c,shared.syntaxerr);
             zfree(ops);
             return;
         }
@@ -1117,9 +1128,9 @@ void bitfieldGeneric(client *c, int flags) {
              * object boundaries. */
             memset(buf,0,9);
             int i;
-            size_t byte = thisop->offset >> 3;
+            uint64_t byte = thisop->offset >> 3;
             for (i = 0; i < 9; i++) {
-                if (src == NULL || i+byte >= (size_t)strlen) break;
+                if (src == NULL || i+byte >= (uint64_t)strlen) break;
                 buf[i] = src[i+byte];
             }
 

@@ -38,7 +38,9 @@ typedef struct clusterLink {
     mstime_t ctime;             /* Link creation time */
     connection *conn;           /* Connection to remote node */
     sds sndbuf;                 /* Packet send buffer */
-    sds rcvbuf;                 /* Packet reception buffer */
+    char *rcvbuf;               /* Packet reception buffer */
+    size_t rcvbuf_len;          /* Used size of rcvbuf */
+    size_t rcvbuf_alloc;        /* Allocated size of rcvbuf */
     struct clusterNode *node;   /* Node related to this link if any, or NULL */
 } clusterLink;
 
@@ -51,8 +53,8 @@ typedef struct clusterLink {
 #define CLUSTER_NODE_HANDSHAKE 32 /* We have still to exchange the first ping */
 #define CLUSTER_NODE_NOADDR   64  /* We don't know the address of this node */
 #define CLUSTER_NODE_MEET 128     /* Send a MEET message to this node */
-#define CLUSTER_NODE_MIGRATE_TO 256 /* Master elegible for replica migration. */
-#define CLUSTER_NODE_NOFAILOVER 512 /* Slave will not try to failver. */
+#define CLUSTER_NODE_MIGRATE_TO 256 /* Master eligible for replica migration. */
+#define CLUSTER_NODE_NOFAILOVER 512 /* Slave will not try to failover. */
 #define CLUSTER_NODE_NULL_NAME "\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000"
 
 #define nodeIsMaster(n) ((n)->flags & CLUSTER_NODE_MASTER)
@@ -77,6 +79,7 @@ typedef struct clusterLink {
 #define CLUSTER_TODO_UPDATE_STATE (1<<1)
 #define CLUSTER_TODO_SAVE_CONFIG (1<<2)
 #define CLUSTER_TODO_FSYNC_CONFIG (1<<3)
+#define CLUSTER_TODO_HANDLE_MANUALFAILOVER (1<<4)
 
 /* Message types.
  *
@@ -116,6 +119,7 @@ typedef struct clusterNode {
     uint64_t configEpoch; /* Last configEpoch observed for this node */
     // 代表节点负责的哈希槽
     unsigned char slots[CLUSTER_SLOTS/8]; /* slots handled by this node */
+    sds slots_info; /* Slots info represented by string. */
     int numslots;   /* Number of slots handled by this node */
     int numslaves;  /* Number of slave nodes, if this is a master */
     struct clusterNode **slaves; /* pointers to slave nodes */
@@ -133,7 +137,9 @@ typedef struct clusterNode {
     mstime_t orphaned_time;     /* Starting time of orphaned master condition */
     long long repl_offset;      /* Last known repl offset for this node. */
     char ip[NET_IP_STR_LEN];  /* Latest known IP address of this node */
-    int port;                   /* Latest known clients port of this node */
+    int port;                   /* Latest known clients port (TLS or plain). */
+    int pport;                  /* Latest known clients plaintext port. Only used
+                                   if the main clients port is for TLS. */
     int cport;                  /* Latest known cluster port of this node. */
     clusterLink *link;          /* TCP/IP link with this node */
     // 报告此节点宕机的节点列表
@@ -175,7 +181,7 @@ typedef struct clusterState {
     clusterNode *mf_slave;      /* Slave performing the manual failover. */
     /* Manual failover state of slave. */
     long long mf_master_offset; /* Master offset the slave needs to start MF
-                                   or zero if stil not received. */
+                                   or -1 if still not received. */
     int mf_can_start;           /* If non-zero signal that the manual failover
                                    can start requesting masters vote. */
     /* The followign fields are used by masters to take state on elections. */
@@ -210,8 +216,8 @@ typedef struct {
     uint16_t cport;             /* cluster port last time it was seen */
     // 在消息发送节点视角该节点的状态
     uint16_t flags;             /* node->flags copy */
-    // 预留字段
-    uint32_t notused1;
+    uint16_t pport;             /* plaintext-port, when base port is TLS */
+    uint16_t notused1; // 预留字段
 } clusterMsgDataGossip;
 
 typedef struct {
@@ -296,9 +302,9 @@ typedef struct {
     char slaveof[CLUSTER_NAMELEN];
     // 发送消息节点的IP
     char myip[NET_IP_STR_LEN];    /* Sender IP, if not all zeroed. */
-    char notused1[34];  /* 34 bytes reserved for future usage. */
-    // 集群总线监听端口
-    uint16_t cport;      /* Sender TCP cluster bus port */
+    char notused1[32];  /* 32 bytes reserved for future usage. */
+    uint16_t pport;      /* Sender TCP plaintext port, if base port is TLS */
+    uint16_t cport;      /* Sender TCP cluster bus port */ // 集群总线监听端口
     // 发送消息节点的状态
     uint16_t flags;      /* Sender node flags */
     // 从发送消息节点的视角来看，当前集群的状态，OK or FAIL

@@ -30,6 +30,9 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include "ae.h"
+#include "anet.h"
+
 #include <stdio.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -40,7 +43,6 @@
 #include <time.h>
 #include <errno.h>
 
-#include "ae.h"
 #include "zmalloc.h"
 #include "config.h"
 
@@ -60,16 +62,18 @@
     #endif
 #endif
 
+
 aeEventLoop *aeCreateEventLoop(int setsize) {
     aeEventLoop *eventLoop;
     int i;
+
+    monotonicInit();    /* just in case the calling app didn't initialize */
 
     if ((eventLoop = zmalloc(sizeof(*eventLoop))) == NULL) goto err;
     eventLoop->events = zmalloc(sizeof(aeFileEvent)*setsize);
     eventLoop->fired = zmalloc(sizeof(aeFiredEvent)*setsize);
     if (eventLoop->events == NULL || eventLoop->fired == NULL) goto err;
     eventLoop->setsize = setsize;
-    eventLoop->lastTime = time(NULL);
     eventLoop->timeEventHead = NULL;
     eventLoop->timeEventNextId = 0;
     eventLoop->stop = 0;
@@ -199,29 +203,6 @@ int aeGetFileEvents(aeEventLoop *eventLoop, int fd) {
     return fe->mask;
 }
 
-static void aeGetTime(long *seconds, long *milliseconds)
-{
-    struct timeval tv;
-
-    gettimeofday(&tv, NULL);
-    *seconds = tv.tv_sec;
-    *milliseconds = tv.tv_usec/1000;
-}
-
-static void aeAddMillisecondsToNow(long long milliseconds, long *sec, long *ms) {
-    long cur_sec, cur_ms, when_sec, when_ms;
-
-    aeGetTime(&cur_sec, &cur_ms);
-    when_sec = cur_sec + milliseconds/1000;
-    when_ms = cur_ms + milliseconds%1000;
-    if (when_ms >= 1000) {
-        when_sec ++;
-        when_ms -= 1000;
-    }
-    *sec = when_sec;
-    *ms = when_ms;
-}
-
 long long aeCreateTimeEvent(aeEventLoop *eventLoop, long long milliseconds,
         aeTimeProc *proc, void *clientData,
         aeEventFinalizerProc *finalizerProc)
@@ -236,7 +217,7 @@ long long aeCreateTimeEvent(aeEventLoop *eventLoop, long long milliseconds,
     // 设置 ID
     te->id = id;
     // 设定处理事件的时间
-    aeAddMillisecondsToNow(milliseconds,&te->when_sec,&te->when_ms);
+    te->when = getMonotonicUs() + milliseconds * 1000;
     // 设置事件处理器
     te->timeProc = proc;
     //设置事件释放函数
@@ -269,10 +250,8 @@ int aeDeleteTimeEvent(aeEventLoop *eventLoop, long long id)
     return AE_ERR; /* NO event with the specified ID found */
 }
 
-/* Search the first timer to fire.
- * This operation is useful to know how many time the select can be
- * put in sleep without to delay any event.
- * If there are no timers NULL is returned.
+/* How many microseconds until the first timer should fire.
+ * If there are no timers, -1 is returned.
  *
  * Note that's O(N) since time events are unsorted.
  * Possible optimizations (not needed by Redis so far, but...):
@@ -280,19 +259,19 @@ int aeDeleteTimeEvent(aeEventLoop *eventLoop, long long id)
  *    Much better but still insertion or deletion of timers is O(N).
  * 2) Use a skiplist to have this operation as O(1) and insertion as O(log(N)).
  */
-static aeTimeEvent *aeSearchNearestTimer(aeEventLoop *eventLoop)
-{
+static int64_t usUntilEarliestTimer(aeEventLoop *eventLoop) {
     aeTimeEvent *te = eventLoop->timeEventHead;
-    aeTimeEvent *nearest = NULL;
+    if (te == NULL) return -1;
 
-    while(te) {
-        if (!nearest || te->when_sec < nearest->when_sec ||
-                (te->when_sec == nearest->when_sec &&
-                 te->when_ms < nearest->when_ms))
-            nearest = te;
+    aeTimeEvent *earliest = NULL;
+    while (te) {
+        if (!earliest || te->when < earliest->when)
+            earliest = te;
         te = te->next;
     }
-    return nearest;
+
+    monotime now = getMonotonicUs();
+    return (now >= earliest->when) ? 0 : earliest->when - now;
 }
 
 /* Process time events */
@@ -300,6 +279,8 @@ static int processTimeEvents(aeEventLoop *eventLoop) {
     int processed = 0;
     aeTimeEvent *te;
     long long maxId;
+    /*remove in 6.2
+     * start
     time_t now = time(NULL);
 
     /* If the system clock is moved to the future, and then set back to the
@@ -315,6 +296,7 @@ static int processTimeEvents(aeEventLoop *eventLoop) {
     // 早期处理事件比无限期地延迟它们的危险要小
     // 通过重置事件的运行时间，
     // 防止因时间穿插（skew）而造成的事件处理混乱
+    /*
     if (now < eventLoop->lastTime) {
         te = eventLoop->timeEventHead;
         while(te) {
@@ -324,11 +306,13 @@ static int processTimeEvents(aeEventLoop *eventLoop) {
     }
     // 更新最后一次处理时间事件的时间
     eventLoop->lastTime = now;
+    * end
+    */
 
     te = eventLoop->timeEventHead;
     maxId = eventLoop->timeEventNextId-1;
+    monotime now = getMonotonicUs();
     while(te) {
-        long now_sec, now_ms;
         long long id;
 
         /* Remove events scheduled for deletion. */
@@ -348,8 +332,10 @@ static int processTimeEvents(aeEventLoop *eventLoop) {
                 eventLoop->timeEventHead = te->next;
             if (te->next)
                 te->next->prev = te->prev;
-            if (te->finalizerProc)
+            if (te->finalizerProc) {
                 te->finalizerProc(eventLoop, te->clientData);
+                now = getMonotonicUs();
+            }
             zfree(te);
             te = next;
             continue;
@@ -365,12 +351,9 @@ static int processTimeEvents(aeEventLoop *eventLoop) {
             te = te->next;
             continue;
         }
-        // 获取当前时间
-        aeGetTime(&now_sec, &now_ms);
+
         // 如果当前时间等于或等于事件的执行时间，那么说明事件已到达，执行这个事件
-        if (now_sec > te->when_sec ||
-            (now_sec == te->when_sec && now_ms >= te->when_ms))
-        {
+        if (te->when <= now) {
             int retval;
 
             id = te->id;
@@ -379,10 +362,11 @@ static int processTimeEvents(aeEventLoop *eventLoop) {
             retval = te->timeProc(eventLoop, id, te->clientData);
             te->refcount--;
             processed++;
+            now = getMonotonicUs();
             // 记录是否有需要循环执行这个事件时间
             if (retval != AE_NOMORE) {
                 // 是的， retval 毫秒之后继续执行这个时间事件
-                aeAddMillisecondsToNow(retval,&te->when_sec,&te->when_ms);
+                te->when = now + retval * 1000;
             } else {
                 // 否，将这个事件删除
                 te->id = AE_DELETED_EVENT_ID;
@@ -415,39 +399,26 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
     /* Nothing to do? return ASAP */
     if (!(flags & AE_TIME_EVENTS) && !(flags & AE_FILE_EVENTS)) return 0;
 
-    /* Note that we want call select() even if there are no
+    /* Note that we want to call select() even if there are no
      * file events to process as long as we want to process time
      * events, in order to sleep until the next time event is ready
      * to fire. */
     if (eventLoop->maxfd != -1 ||
         ((flags & AE_TIME_EVENTS) && !(flags & AE_DONT_WAIT))) {
         int j;
-        aeTimeEvent *shortest = NULL;
         struct timeval tv, *tvp;
+        int64_t usUntilTimer = -1;
+
         // 获取最近的时间事件
         if (flags & AE_TIME_EVENTS && !(flags & AE_DONT_WAIT))
-            shortest = aeSearchNearestTimer(eventLoop);
-        if (shortest) {
+            usUntilTimer = usUntilEarliestTimer(eventLoop);
+
+        if (usUntilTimer >= 0) {
             // 如果时间事件存在的话
             // 那么根据最近可执行时间事件和现在时间的时间差来决定文件事件的阻塞时间
-            long now_sec, now_ms;
-
-            aeGetTime(&now_sec, &now_ms);
+            tv.tv_sec = usUntilTimer / 1000000;
+            tv.tv_usec = usUntilTimer % 1000000;
             tvp = &tv;
-
-            /* How many milliseconds we need to wait for the next
-             * time event to fire? */
-            long long ms =
-                (shortest->when_sec - now_sec)*1000 +
-                shortest->when_ms - now_ms;
-
-            if (ms > 0) {
-                tvp->tv_sec = ms/1000;
-                tvp->tv_usec = (ms % 1000)*1000;
-            } else {
-                tvp->tv_sec = 0;
-                tvp->tv_usec = 0;
-            }
         } else {
             // 执行到这一步，说明没有时间事件
             // 那么根据 AE_DONT_WAIT 是否设置来决定是否阻塞，以及阻塞的时间长度
@@ -488,7 +459,7 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
             int fired = 0; /* Number of events fired for current fd. */
 
             /* Normally we execute the readable event first, and the writable
-             * event laster. This is useful as sometimes we may be able
+             * event later. This is useful as sometimes we may be able
              * to serve the reply of a query immediately after processing the
              * query.
              *
@@ -496,7 +467,7 @@ int aeProcessEvents(aeEventLoop *eventLoop, int flags)
              * asking us to do the reverse: never fire the writable event
              * after the readable. In such a case, we invert the calls.
              * This is useful when, for instance, we want to do things
-             * in the beforeSleep() hook, like fsynching a file to disk,
+             * in the beforeSleep() hook, like fsyncing a file to disk,
              * before replying to a client. */
             int invert = fe->mask & AE_BARRIER;
 
